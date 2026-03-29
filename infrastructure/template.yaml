@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Secure Serverless Asset Proxy
+  Architecture: CloudFront → Lambda Function URL → Private S3 Bucket
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: >
+      Fully-qualified ECR image URI including tag, e.g.
+      123456789012.dkr.ecr.us-east-1.amazonaws.com/asset-proxy:abc1234
+
+  OriginVerifyToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      Shared secret injected as X-Origin-Verify header by CloudFront and
+      validated by the Lambda to block direct Function URL access.
+    MinLength: 32
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment tag value.
+
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ─── Private S3 bucket ──────────────────────────────────────────────────────
+  AssetBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-assets-${AWS::AccountId}"
+      # Block every form of public access
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Versioning keeps previous object versions
+      VersioningConfiguration:
+        Status: Enabled
+      # Server-side encryption at rest
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Block unintended object deletions
+      ObjectLockEnabled: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Explicitly deny any public access via bucket policy
+  AssetBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AssetBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AssetBucket.Arn
+              - !Sub "${AssetBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: AllowLambdaRole
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action: s3:GetObject
+            Resource: !Sub "${AssetBucket.Arn}/*"
+
+  # ─── IAM role – least privilege ─────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-exec-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # CloudWatch Logs only
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3GetObjectOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowGetObject
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "${AssetBucket.Arn}/*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── Lambda function (container image from ECR) ──────────────────────────────
+  AssetProxyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-proxy"
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref AssetBucket
+          ORIGIN_VERIFY_TOKEN: !Ref OriginVerifyToken
+          # Set to a prefix (e.g. "public/") to restrict which S3 keys are
+          # accessible. Leave empty to allow any key within the bucket.
+          ALLOWED_PREFIX: ""
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── Lambda Function URL (unauthenticated – protected by shared secret) ──────
+  AssetProxyFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt AssetProxyFunction.Arn
+      Cors:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+
+  # Grant public invocation via Function URL (access is gated by secret header)
+  FunctionUrlPublicPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AssetProxyFunction.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  # ─── Security headers response policy ───────────────────────────────────────
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-security-headers"
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: true
+            Preload: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          XSSProtection:
+            ModeBlock: true
+            Protection: true
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+        CustomHeadersConfig:
+          Items:
+            - Header: Permissions-Policy
+              Value: "geolocation=(), microphone=(), camera=()"
+              Override: true
+
+  # ─── CloudFront distribution ─────────────────────────────────────────────────
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "Asset proxy – ${AWS::StackName}"
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+
+        Origins:
+          - Id: LambdaFunctionUrlOrigin
+            # Extract domain from "https://<domain>/" returned by !GetAtt
+            DomainName: !Select
+              - 2
+              - !Split ["/", !GetAtt AssetProxyFunctionUrl.FunctionUrl]
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+            # Shared secret – Lambda rejects requests lacking this header
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginVerifyToken
+
+        DefaultCacheBehavior:
+          TargetOriginId: LambdaFunctionUrlOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Forward the "key" query parameter and use it as a cache key
+          CachePolicyId: !Ref AssetCachePolicy
+          OriginRequestPolicyId: !Ref AssetOriginRequestPolicy
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Cache on the "key" query string only
+  AssetCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${AWS::StackName}-asset-cache"
+        DefaultTTL: 3600
+        MaxTTL: 86400
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          QueryStringsConfig:
+            QueryStringBehavior: whitelist
+            QueryStrings:
+              Items: [key]
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+
+  # Forward "key" query parameter to the origin
+  AssetOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request"
+        QueryStringsConfig:
+          QueryStringBehavior: whitelist
+          QueryStrings:
+            Items: [key]
+        HeadersConfig:
+          HeaderBehavior: none
+        CookiesConfig:
+          CookieBehavior: none
+
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  CloudFrontDomain:
+    Description: CloudFront distribution domain name – use this as your public URL
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDomain"
+
+  LambdaFunctionUrl:
+    Description: Direct Lambda Function URL (protect with ORIGIN_VERIFY_TOKEN)
+    Value: !GetAtt AssetProxyFunctionUrl.FunctionUrl
+
+  AssetBucketName:
+    Description: Private S3 bucket name – upload assets here
+    Value: !Ref AssetBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-AssetBucketName"
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt AssetProxyFunction.Arn

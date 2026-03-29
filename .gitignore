@@ -1,0 +1,12 @@
+# Compiled Go binaries
+lambda/lambda
+lambda/bootstrap
+
+# Build artifacts
+*.exe
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum

@@ -1,0 +1,65 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_uri:
+        description: "Fully-qualified ECR image URI to deploy (e.g. 123….dkr.ecr.us-east-1.amazonaws.com/asset-proxy:abc1234)"
+        required: true
+      environment:
+        description: "Target environment"
+        required: false
+        default: prod
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: asset-proxy
+
+permissions:
+  id-token: write   # OIDC token for aws-actions/configure-aws-credentials
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy CloudFormation Stack
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── AWS credentials via OIDC ───────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Deploy (or update) the CloudFormation stack ───────────────────────
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/template.yaml \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides \
+                ImageUri="${{ inputs.image_uri }}" \
+                OriginVerifyToken="${{ secrets.ORIGIN_VERIFY_TOKEN }}" \
+                Environment="${{ inputs.environment }}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --region "$AWS_REGION"
+
+      # ── Print stack outputs for quick reference ────────────────────────────
+      - name: Show stack outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs" \
+            --output table
