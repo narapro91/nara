@@ -20,33 +20,42 @@ import (
 
 const maxObjectBytes = 50 * 1024 * 1024 // 50 MB safety limit
 
-var (
-	s3Client          *s3.Client
-	bucketName        string
-	originVerifyToken string
-	allowedPrefix     string // optional prefix restriction, e.g. "assets/"
-)
-
-func init() {
-	cfg, err := config.LoadDefaultConfig(context.Background())
-	if err != nil {
-		log.Fatalf("unable to load AWS SDK config: %v", err)
-	}
-
-	s3Client = s3.NewFromConfig(cfg)
-
-	bucketName = os.Getenv("BUCKET_NAME")
-	if bucketName == "" {
-		log.Fatal("BUCKET_NAME environment variable is required")
-	}
-
-	// Optional shared-secret to verify requests arrive via CloudFront.
-	originVerifyToken = os.Getenv("ORIGIN_VERIFY_TOKEN")
-
-	// Optional prefix restriction (e.g. "public/"). Empty means no restriction.
-	allowedPrefix = os.Getenv("ALLOWED_PREFIX")
+// s3Getter is the subset of the S3 API used by the proxy.
+// Keeping it minimal makes unit testing trivial — just implement the interface.
+type s3Getter interface {
+	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 }
 
+// App holds the handler's runtime dependencies.
+type App struct {
+	s3             s3Getter
+	bucketName     string
+	verifyToken    string // X-Origin-Verify shared secret; empty = disabled
+	allowedPrefix  string // optional S3 key prefix restriction; empty = no restriction
+}
+
+// newApp reads configuration from environment variables and creates a live AWS
+// S3 client. It is called once from main.
+func newApp(ctx context.Context) (*App, error) {
+	bucketName := os.Getenv("BUCKET_NAME")
+	if bucketName == "" {
+		return nil, fmt.Errorf("BUCKET_NAME environment variable is required")
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("unable to load AWS SDK config: %w", err)
+	}
+
+	return &App{
+		s3:            s3.NewFromConfig(cfg),
+		bucketName:    bucketName,
+		verifyToken:   os.Getenv("ORIGIN_VERIFY_TOKEN"),
+		allowedPrefix: os.Getenv("ALLOWED_PREFIX"),
+	}, nil
+}
+
+// jsonError builds a simple JSON error response.
 func jsonError(statusCode int, message string) events.LambdaFunctionURLResponse {
 	return events.LambdaFunctionURLResponse{
 		StatusCode: statusCode,
@@ -58,7 +67,7 @@ func jsonError(statusCode int, message string) events.LambdaFunctionURLResponse 
 }
 
 // validateKey rejects path-traversal attempts and enforces an optional prefix.
-func validateKey(key string) error {
+func validateKey(key, allowedPrefix string) error {
 	if key == "" {
 		return fmt.Errorf("key must not be empty")
 	}
@@ -83,27 +92,28 @@ func validateKey(key string) error {
 	return nil
 }
 
-func handler(ctx context.Context, req events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
+// handler is the Lambda entry point.
+func (a *App) handler(ctx context.Context, req events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	// Lambda Function URL normalises all incoming headers to lowercase.
 	// Verify the shared-secret header so that direct Function URL calls are
 	// rejected; only CloudFront (which injects the header) can reach the origin.
-	if originVerifyToken != "" {
-		if req.Headers["x-origin-verify"] != originVerifyToken {
+	if a.verifyToken != "" {
+		if req.Headers["x-origin-verify"] != a.verifyToken {
 			log.Printf("forbidden: missing or invalid x-origin-verify header")
 			return jsonError(http.StatusForbidden, "forbidden"), nil
 		}
 	}
 
 	key := req.QueryStringParameters["key"]
-	if err := validateKey(key); err != nil {
+	if err := validateKey(key, a.allowedPrefix); err != nil {
 		log.Printf("invalid key %q: %v", key, err)
 		return jsonError(http.StatusBadRequest, err.Error()), nil
 	}
 
-	log.Printf("fetching s3 object: bucket=%s key=%s", bucketName, key)
+	log.Printf("fetching s3 object: bucket=%s key=%s", a.bucketName, key)
 
-	result, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucketName),
+	result, err := a.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(a.bucketName),
 		Key:    aws.String(key),
 	})
 	if err != nil {
@@ -157,5 +167,9 @@ func handler(ctx context.Context, req events.LambdaFunctionURLRequest) (events.L
 }
 
 func main() {
-	lambda.Start(handler)
+	app, err := newApp(context.Background())
+	if err != nil {
+		log.Fatalf("failed to initialise app: %v", err)
+	}
+	lambda.Start(app.handler)
 }
